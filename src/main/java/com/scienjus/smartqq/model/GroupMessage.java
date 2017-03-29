@@ -78,4 +78,14 @@ public class GroupMessage {
         this.font = font;
     }
 
+    @Override
+    public String toString() {
+        return "GroupMessage{" +
+                "groupId=" + groupId +
+                ", time=" + time +
+                ", content='" + content + '\'' +
+                ", userId=" + userId +
+                ", font=" + font +
+                '}';
+    }
 }

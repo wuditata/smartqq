@@ -71,4 +71,14 @@ public class DiscussMessage {
         this.font = font;
     }
 
+    @Override
+    public String toString() {
+        return "DiscussMessage{" +
+                "discussId=" + discussId +
+                ", time=" + time +
+                ", content='" + content + '\'' +
+                ", userId=" + userId +
+                ", font=" + font +
+                '}';
+    }
 }

@@ -67,4 +67,13 @@ public class Message {
         this.font = font;
     }
 
+    @Override
+    public String toString() {
+        return "Message{" +
+                "time=" + time +
+                ", content='" + content + '\'' +
+                ", userId=" + userId +
+                ", font=" + font +
+                '}';
+    }
 }

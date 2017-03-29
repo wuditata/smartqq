@@ -6,20 +6,27 @@ import com.alibaba.fastjson.JSONObject;
 import com.scienjus.smartqq.callback.MessageCallback;
 import com.scienjus.smartqq.constant.ApiURL;
 import com.scienjus.smartqq.model.*;
+import com.scienjus.smartqq.model.Font;
 import net.dongliu.requests.Client;
 import net.dongliu.requests.HeadOnlyRequestBuilder;
 import net.dongliu.requests.Response;
 import net.dongliu.requests.Session;
 import net.dongliu.requests.exception.RequestException;
 import net.dongliu.requests.struct.Cookie;
-import org.apache.log4j.Logger;
+import net.dongliu.requests.struct.Cookies;
+import org.apache.commons.io.FileUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.awt.Desktop;
+import java.awt.*;
 import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
 import java.net.SocketTimeoutException;
 import java.util.*;
+import java.util.List;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Api客户端.
@@ -29,9 +36,7 @@ import java.util.*;
  * @date 2015/12/18.
  */
 public class SmartQQClient implements Closeable {
-
-    //日志
-    private static final Logger LOGGER = Logger.getLogger(SmartQQClient.class);
+    private static final Logger logger = LoggerFactory.getLogger(SmartQQClient.class);
 
     //消息id，这个好像可以随便设置，所以设成全局的
     private static long MESSAGE_ID = 43690001;
@@ -57,43 +62,67 @@ public class SmartQQClient implements Closeable {
     private long uin;
     private String psessionid;
 
+    private SmartQQState state;
+
+    private MessageCallback callback;
+
     //线程开关
     private volatile boolean pollStarted;
 
+    private QQDataUpdater updater;
+
+    private ScheduledThreadPoolExecutor executor;
+
+    public SmartQQClient() {
+    }
+
     public SmartQQClient(final MessageCallback callback) {
+        this.callback = callback;
+    }
+
+    public void start() {
+        this.executor = new ScheduledThreadPoolExecutor(5);
+
         this.client = Client.pooled().maxPerRoute(5).maxTotal(10).build();
         this.session = client.session();
         login();
-        if (callback != null) {
-            this.pollStarted = true;
-            new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    while (true) {
-                        if (!pollStarted) {
-                            return;
+        startPollMessage();
+    }
+
+    private void startPollMessage() {
+        if (this.callback == null) return;
+
+        this.pollStarted = true;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                while (true) {
+                    if (!pollStarted) {
+                        return;
+                    }
+                    try {
+                        pollMessage(callback);
+                    } catch (RequestException e) {
+                        //忽略SocketTimeoutException
+                        if (!(e.getCause() instanceof SocketTimeoutException)) {
+                            logger.error(e.getMessage());
                         }
-                        try {
-                            pollMessage(callback);
-                        } catch (RequestException e) {
-                            //忽略SocketTimeoutException
-                            if (!(e.getCause() instanceof SocketTimeoutException)) {
-                                LOGGER.error(e.getMessage());
-                            }
-                        } catch (Exception e) {
-                            LOGGER.error(e.getMessage());
-                        }
+                    } catch (Exception e) {
+                        logger.error(e.getMessage());
                     }
                 }
-            }).start();
-        }
+            }
+        }).start();
     }
 
     /**
      * 登录
      */
     private void login() {
-        getQRCode();
+        setState(SmartQQState.INIT);
+
+        //getQRCode();
+        setState(SmartQQState.WAIT_LOGIN);
         String url = verifyQRCode();
         getPtwebqq(url);
         getVfwebqq();
@@ -101,39 +130,83 @@ public class SmartQQClient implements Closeable {
         getFriendStatus(); //修复Api返回码[103]的问题
         //登录成功欢迎语
         UserInfo userInfo = getAccountInfo();
-        LOGGER.info(userInfo.getNick() + "，欢迎！");
+        logger.info(userInfo.getNick() + "，欢迎！");
+
+        setState(SmartQQState.LOGINED);
+
+        updater = new QQDataUpdater(this);
+
+        // 定时更新用户列表信息
+        executor.scheduleAtFixedRate(new Runnable() {
+            @Override
+            public void run() {
+                updater.run();
+            }
+        }, 0, 5, TimeUnit.MINUTES);
+    }
+
+    private boolean isAutoLogin = false;
+    private void autoLogin() {
+        if(isAutoLogin) {
+            try {
+                File cookieFile = new File("cookie.dat");
+                if(cookieFile.exists() && cookieFile.isFile()) {
+                    //String json = FileUtils.readFileToString(cookieFile);
+                    //Cookies cookies = JSONObject.parseObject(json, Cookies.class);
+                    //this.qrsig = getQRSignCode(cookies);
+                    this.qrsig = FileUtils.readFileToString(cookieFile);
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
     }
 
     //登录流程1：获取二维码
     private void getQRCode() {
-        LOGGER.debug("开始获取二维码");
+        logger.debug("开始获取二维码");
 
         //本地存储二维码图片
-        String filePath;
-        try {
-            filePath = new File("qrcode.png").getCanonicalPath();
-        } catch (IOException e) {
-            throw new IllegalStateException("二维码保存失败");
+        File file = getQRCodeFile();
+        if(!file.canWrite()) {
+            throw new IllegalStateException("二维码地址不可写: " + file.getPath());
         }
         Response response = session.get(ApiURL.GET_QR_CODE.getUrl())
                 .addHeader("User-Agent", ApiURL.USER_AGENT)
-                .file(filePath);
-        for (Cookie cookie : response.getCookies()) {
+                .file(file);
+        Cookies cookies = response.getCookies();
+        this.qrsig = getQRSignCode(cookies);
+
+        try {
+            FileUtils.writeStringToFile(new File("cookie.dat"), qrsig, false);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        logger.info("二维码已保存在 " + file.getPath() + " 文件中，请打开手机QQ并扫描二维码");
+
+        //使用默认软件打开二维码
+        Desktop desk = Desktop.getDesktop();
+        try {
+            desk.open(file);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    public File getQRCodeFile() {
+        return new File("qrcode.png");
+    }
+
+    private String getQRSignCode(Cookies cookies) {
+        String qrsig = null;
+        for (Cookie cookie : cookies) {
             if (Objects.equals(cookie.getName(), "qrsig")) {
                 qrsig = cookie.getValue();
                 break;
             }
         }
-        LOGGER.info("二维码已保存在 " + filePath + " 文件中，请打开手机QQ并扫描二维码");
-
-        //使用默认软件打开二维码
-        Desktop desk = Desktop.getDesktop();
-        try {
-            File file = new File(filePath);
-            desk.open(file);
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+        return qrsig;
     }
 
     //用于生成ptqrtoken的哈希函数
@@ -146,32 +219,38 @@ public class SmartQQClient implements Closeable {
 
     //登录流程2：校验二维码
     private String verifyQRCode() {
-        LOGGER.debug("等待扫描二维码");
+        logger.debug("检查是否可以自动登录");
+        autoLogin();
 
         //阻塞直到确认二维码认证成功
         while (true) {
-            sleep(1);
-            Response<String> response = get(ApiURL.VERIFY_QR_CODE, hash33(qrsig));
-            String result = response.getBody();
+            String result = "";
+            if(qrsig != null) {
+                Response<String> response = get(ApiURL.VERIFY_QR_CODE, hash33(qrsig));
+                result = response.getBody();
+            }
             if (result.contains("成功")) {
                 for (String content : result.split("','")) {
                     if (content.startsWith("http")) {
-                        LOGGER.info("正在登录，请稍后");
+                        logger.info("正在登录，请稍后");
 
                         return content;
                     }
                 }
-            } else if (result.contains("已失效")) {
-                LOGGER.info("二维码已失效，尝试重新获取二维码");
+            } else if ("".equals(result) || result.contains("已失效")) {
+                logger.info("二维码已失效，尝试重新获取二维码");
                 getQRCode();
             }
+
+            logger.debug("等待扫描二维码");
+            sleep(2);
         }
 
     }
 
     //登录流程3：获取ptwebqq
     private void getPtwebqq(String url) {
-        LOGGER.debug("开始获取ptwebqq");
+        logger.debug("开始获取ptwebqq");
 
         Response<String> response = get(ApiURL.GET_PTWEBQQ, url);
         this.ptwebqq = response.getCookies().get("ptwebqq").iterator().next().getValue();
@@ -179,7 +258,7 @@ public class SmartQQClient implements Closeable {
 
     //登录流程4：获取vfwebqq
     private void getVfwebqq() {
-        LOGGER.debug("开始获取vfwebqq");
+        logger.debug("开始获取vfwebqq");
 
         Response<String> response = get(ApiURL.GET_VFWEBQQ, ptwebqq);
         this.vfwebqq = getJsonObjectResult(response).getString("vfwebqq");
@@ -187,7 +266,7 @@ public class SmartQQClient implements Closeable {
 
     //登录流程5：获取uin和psessionid
     private void getUinAndPsessionid() {
-        LOGGER.debug("开始获取uin和psessionid");
+        logger.debug("开始获取uin和psessionid");
 
         JSONObject r = new JSONObject();
         r.put("ptwebqq", ptwebqq);
@@ -207,7 +286,7 @@ public class SmartQQClient implements Closeable {
      * @return
      */
     public List<Group> getGroupList() {
-        LOGGER.debug("开始获取群列表");
+        logger.debug("开始获取群列表");
 
         JSONObject r = new JSONObject();
         r.put("vfwebqq", vfwebqq);
@@ -224,7 +303,7 @@ public class SmartQQClient implements Closeable {
      * @param callback 获取消息后的回调
      */
     private void pollMessage(MessageCallback callback) {
-        LOGGER.debug("开始接收消息");
+        logger.debug("开始接收消息");
 
         JSONObject r = new JSONObject();
         r.put("ptwebqq", ptwebqq);
@@ -237,12 +316,19 @@ public class SmartQQClient implements Closeable {
         for (int i = 0; array != null && i < array.size(); i++) {
             JSONObject message = array.getJSONObject(i);
             String type = message.getString("poll_type");
+            JSONObject value = message.getJSONObject("value");
             if ("message".equals(type)) {
-                callback.onMessage(new Message(message.getJSONObject("value")));
+                Message msg = new Message(value);
+                Friend friend = updater.getFriend(msg);
+                callback.onMessage(msg, friend);
             } else if ("group_message".equals(type)) {
-                callback.onGroupMessage(new GroupMessage(message.getJSONObject("value")));
+                GroupMessage msg = new GroupMessage(value);
+                Group group = updater.getGroup(msg);
+                callback.onGroupMessage(msg, group);
             } else if ("discu_message".equals(type)) {
-                callback.onDiscussMessage(new DiscussMessage(message.getJSONObject("value")));
+                DiscussMessage msg = new DiscussMessage(value);
+                Discuss discuss = updater.getDiscuss(msg);
+                callback.onDiscussMessage(msg, discuss);
             }
         }
     }
@@ -254,7 +340,7 @@ public class SmartQQClient implements Closeable {
      * @param msg     消息内容
      */
     public void sendMessageToGroup(long groupId, String msg) {
-        LOGGER.debug("开始发送群消息");
+        logger.debug("开始发送群消息");
 
         JSONObject r = new JSONObject();
         r.put("group_uin", groupId);
@@ -275,7 +361,7 @@ public class SmartQQClient implements Closeable {
      * @param msg       消息内容
      */
     public void sendMessageToDiscuss(long discussId, String msg) {
-        LOGGER.debug("开始发送讨论组消息");
+        logger.debug("开始发送讨论组消息");
 
         JSONObject r = new JSONObject();
         r.put("did", discussId);
@@ -296,7 +382,7 @@ public class SmartQQClient implements Closeable {
      * @param msg      消息内容
      */
     public void sendMessageToFriend(long friendId, String msg) {
-        LOGGER.debug("开始发送消息");
+        logger.debug("开始发送消息");
 
         JSONObject r = new JSONObject();
         r.put("to", friendId);
@@ -316,7 +402,7 @@ public class SmartQQClient implements Closeable {
      * @return
      */
     public List<Discuss> getDiscussList() {
-        LOGGER.debug("开始获取讨论组列表");
+        logger.debug("开始获取讨论组列表");
 
         Response<String> response = get(ApiURL.GET_DISCUSS_LIST, psessionid, vfwebqq);
         return JSON.parseArray(getJsonObjectResult(response).getJSONArray("dnamelist").toJSONString(), Discuss.class);
@@ -328,7 +414,7 @@ public class SmartQQClient implements Closeable {
      * @return
      */
     public List<Category> getFriendListWithCategory() {
-        LOGGER.debug("开始获取好友列表");
+        logger.debug("开始获取好友列表");
 
         JSONObject r = new JSONObject();
         r.put("vfwebqq", vfwebqq);
@@ -361,7 +447,7 @@ public class SmartQQClient implements Closeable {
      * @return
      */
     public List<Friend> getFriendList() {
-        LOGGER.debug("开始获取好友列表");
+        logger.debug("开始获取好友列表");
 
         JSONObject r = new JSONObject();
         r.put("vfwebqq", vfwebqq);
@@ -403,7 +489,7 @@ public class SmartQQClient implements Closeable {
      * @return
      */
     public UserInfo getAccountInfo() {
-        LOGGER.debug("开始获取登录用户信息");
+        logger.debug("开始获取登录用户信息");
 
         Response<String> response = get(ApiURL.GET_ACCOUNT_INFO);
         return JSON.parseObject(getJsonObjectResult(response).toJSONString(), UserInfo.class);
@@ -415,7 +501,7 @@ public class SmartQQClient implements Closeable {
      * @return
      */
     public UserInfo getFriendInfo(long friendId) {
-        LOGGER.debug("开始获取好友信息");
+        logger.debug("开始获取好友信息");
 
         Response<String> response = get(ApiURL.GET_FRIEND_INFO, friendId, vfwebqq, psessionid);
         return JSON.parseObject(getJsonObjectResult(response).toJSONString(), UserInfo.class);
@@ -427,7 +513,7 @@ public class SmartQQClient implements Closeable {
      * @return
      */
     public List<Recent> getRecentList() {
-        LOGGER.debug("开始获取最近会话列表");
+        logger.debug("开始获取最近会话列表");
 
         JSONObject r = new JSONObject();
         r.put("vfwebqq", vfwebqq);
@@ -445,7 +531,7 @@ public class SmartQQClient implements Closeable {
      * @return
      */
     public long getQQById(long friendId) {
-        LOGGER.debug("开始获取QQ号");
+        logger.debug("开始获取QQ号");
 
         Response<String> response = get(ApiURL.GET_QQ_BY_ID, friendId, vfwebqq);
         return getJsonObjectResult(response).getLongValue("account");
@@ -517,7 +603,7 @@ public class SmartQQClient implements Closeable {
      * @return
      */
     public List<FriendStatus> getFriendStatus() {
-        LOGGER.debug("开始获取好友状态");
+        logger.debug("开始获取好友状态");
 
         Response<String> response = get(ApiURL.GET_FRIEND_STATUS, vfwebqq, psessionid);
         return JSON.parseArray(getJsonArrayResult(response).toJSONString(), FriendStatus.class);
@@ -530,7 +616,7 @@ public class SmartQQClient implements Closeable {
      * @return
      */
     public GroupInfo getGroupInfo(long groupCode) {
-        LOGGER.debug("开始获取群资料");
+        logger.debug("开始获取群资料");
 
         Response<String> response = get(ApiURL.GET_GROUP_INFO, groupCode, vfwebqq);
         JSONObject result = getJsonObjectResult(response);
@@ -572,7 +658,7 @@ public class SmartQQClient implements Closeable {
      * @return
      */
     public DiscussInfo getDiscussInfo(long discussId) {
-        LOGGER.debug("开始获取讨论组资料");
+        logger.debug("开始获取讨论组资料");
 
         Response<String> response = get(ApiURL.GET_DISCUSS_INFO, discussId, vfwebqq, psessionid);
         JSONObject result = getJsonObjectResult(response);
@@ -639,14 +725,14 @@ public class SmartQQClient implements Closeable {
     //检查消息是否发送成功
     private static void checkSendMsgResult(Response<String> response) {
         if (response.getStatusCode() != 200) {
-            LOGGER.error(String.format("发送失败，Http返回码[%d]", response.getStatusCode()));
+            logger.error(String.format("发送失败，Http返回码[%d]", response.getStatusCode()));
         }
         JSONObject json = JSON.parseObject(response.getBody());
         Integer errCode = json.getInteger("errCode");
         if (errCode != null && errCode == 0) {
-            LOGGER.debug("发送成功");
+            logger.debug("发送成功");
         } else {
-            LOGGER.error(String.format("发送失败，Api返回码[%d]", json.getInteger("retcode")));
+            logger.error(String.format("发送失败，Api返回码[%d]", json.getInteger("retcode")));
         }
     }
 
@@ -662,16 +748,15 @@ public class SmartQQClient implements Closeable {
         } else if (retCode != 0) {
             switch (retCode) {
                 case 103: {
-                    LOGGER.error("请求失败，Api返回码[103]。你需要进入http://w.qq.com，检查是否能正常接收消息。如果可以的话点击[设置]->[退出登录]后查看是否恢复正常"); 
+                    logger.error("请求失败，Api返回码[103]。你需要进入http://w.qq.com，检查是否能正常接收消息。如果可以的话点击[设置]->[退出登录]后查看是否恢复正常");
                     break;
                 }
                 case 100100: {
-                    LOGGER.debug("请求失败，Api返回码[100100]");
+                    logger.debug("请求失败，Api返回码[100100]");
                     break;
                 }
                 default: {
                     throw new RequestException(String.format("请求失败，Api返回码[%d]", retCode));
-                    break;
                 }
             }
         }
@@ -720,11 +805,32 @@ public class SmartQQClient implements Closeable {
         return V1;
     }
 
+    public SmartQQState getState() {
+        return state;
+    }
+
+    public void setState(SmartQQState state) {
+        this.state = state;
+    }
+
+    public MessageCallback getCallback() {
+        return callback;
+    }
+
+    public void setCallback(MessageCallback callback) {
+        this.callback = callback;
+    }
+
     @Override
     public void close() throws IOException {
         this.pollStarted = false;
         if (this.client != null) {
             this.client.close();
+            this.client = null;
         }
+    }
+
+    public boolean isClose() {
+        return this.client == null;
     }
 }

@@ -17,17 +17,17 @@ public class Application {
         //创建一个新对象时需要扫描二维码登录，并且传一个处理接收到消息的回调，如果你不需要接收消息，可以传null
         SmartQQClient client = new SmartQQClient(new MessageCallback() {
             @Override
-            public void onMessage(Message message) {
+            public void onMessage(Message message, Friend friend) {
                 System.out.println(message.getContent());
             }
 
             @Override
-            public void onGroupMessage(GroupMessage message) {
+            public void onGroupMessage(GroupMessage message, Group group) {
                 System.out.println(message.getContent());
             }
 
             @Override
-            public void onDiscussMessage(DiscussMessage message) {
+            public void onDiscussMessage(DiscussMessage message, Discuss discuss) {
                 System.out.println(message.getContent());
             }
         });
